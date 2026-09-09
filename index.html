@@ -311,9 +311,8 @@
   tabs.forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
 
   // ---------- ① 書く / QR生成 ----------
-  // qrcodejsは内部でUTF-8への変換を行うため、
-  // 日本語を自前でencodeURIComponentしてから渡さない。
-  // ここで二重に変換すると、QRのデータが壊れて読み取りにくくなる。
+  // 日本語を含む質問は、URLエンコードした文字列としてQRに格納する。
+  // jsQRで読み取ったあとにdecodeURIComponent()で元の日本語へ戻す。
   let qrObj = null;
   document.getElementById('makeQrBtn').addEventListener('click', () => {
     const text = document.getElementById('questionInput').value.trim();
@@ -322,10 +321,13 @@
     const box = document.getElementById('qrcodeBox');
     box.innerHTML = '';
 
+    // QR内部はASCIIだけにすることで、ライブラリ間の日本語文字コード問題を回避。
+    const qrText = 'TALKCARD:' + encodeURIComponent(text);
+
     qrObj = new QRCode(box, {
-      text: text,
-      width: 280,
-      height: 280,
+      text: qrText,
+      width: 300,
+      height: 300,
       correctLevel: QRCode.CorrectLevel.H
     });
 
@@ -416,9 +418,18 @@
           lastCode = code.data;
           lastCodeTime = now;
 
-          // qrcodejsが生成したUTF-8 QRはjsQR側で文字列として復元されるため、
-          // ここでもう一度decodeURIComponentしない。
-          const text = code.data;
+          // QRにはASCIIのURLエンコード文字列を入れているので、
+          // ここで安全に元の日本語へ戻す。
+          let text = code.data;
+          if(text.startsWith('TALKCARD:')){
+            try{
+              text = decodeURIComponent(text.slice('TALKCARD:'.length));
+            }catch(e){
+              showToast('QRの文字を読み取れませんでした');
+              requestAnimationFrame(scanLoop);
+              return;
+            }
+          }
 
           // 同じ質問を連続して追加する事故も防ぐ
           if(!deck.includes(text)){
