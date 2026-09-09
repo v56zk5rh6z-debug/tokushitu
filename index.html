@@ -311,26 +311,31 @@
   tabs.forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
 
   // ---------- ① 書く / QR生成 ----------
-  // 日本語を含む質問は、URLエンコードした文字列としてQRに格納する。
-  // jsQRで読み取ったあとにdecodeURIComponent()で元の日本語へ戻す。
+  // 使っているQRライブラリ(qrcodejs)は日本語などのマルチバイト文字を
+  // そのまま渡すと1文字1byteとして切り詰めてしまい、QRが壊れて
+  // 他のカメラで読み取れなくなる。事前にUTF-8のバイト列に変換してから渡す。
+  function toUtf8Bytes(str){
+    return unescape(encodeURIComponent(str));
+  }
   let qrObj = null;
   document.getElementById('makeQrBtn').addEventListener('click', () => {
-    const text = document.getElementById('questionInput').value.trim();
-    if(!text){ showToast('質問を入力してね'); return; }
+  const original = document.getElementById('questionInput').value.trim();
+  if(!original){ showToast('質問を入力してね'); return; }
 
-    const box = document.getElementById('qrcodeBox');
-    box.innerHTML = '';
+  // QRにはASCII文字だけを入れて、日本語の文字コード問題を回避
+  const payload = 'TALKCARD_V3|' + encodeURIComponent(original);
+  const box = document.getElementById('qrcodeBox');
+  box.innerHTML = '';
 
-    // QR内部はASCIIだけにすることで、ライブラリ間の日本語文字コード問題を回避。
-    const qrText = 'TALKCARD:' + encodeURIComponent(text);
+  qrObj = new QRCode(box, {
+    text: payload,
+    width: 320,
+    height: 320,
+    correctLevel: QRCode.CorrectLevel.M
+  });
 
-    qrObj = new QRCode(box, {
-      text: qrText,
-      width: 300,
-      height: 300,
-      correctLevel: QRCode.CorrectLevel.H
-    });
-
+  document.getElementById('qrResult').style.display = 'flex';
+});
     document.getElementById('qrResult').style.display = 'flex';
   });
   document.getElementById('anotherQBtn').addEventListener('click', () => {
@@ -346,102 +351,194 @@
   const camBtn = document.getElementById('camBtn');
   const poolCountEl = document.getElementById('poolCount');
   let stream = null;
-  let scanning = false;
-  let lastCode = '';
-  let lastCodeTime = 0;
-  const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d');
+let scanning = false;
+let lastCode = '';
+let lastCodeTime = 0;
+let scanBusy = false;
 
-  async function startCamera(){
-    try{
-      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 1280 } } });
-      video.srcObject = stream;
-      video.style.display = 'block';
-      overlay.style.display = 'none';
-      frame.style.display = 'block';
-      await video.play();
-      scanning = true;
-      camBtn.textContent = 'カメラを止める';
-      requestAnimationFrame(scanLoop);
-    }catch(e){
-      showToast('カメラを起動できませんでした。設定でカメラ許可を確認してね');
+const canvas = document.createElement('canvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+async function enableContinuousFocus(track){
+  try{
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    if(caps.focusMode && caps.focusMode.includes('continuous')){
+      await track.applyConstraints({advanced:[{focusMode:'continuous'}]});
     }
+  }catch(e){}
+}
+
+async function startCamera(){
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        facingMode: {ideal:'environment'},
+        width: {ideal:1920},
+        height: {ideal:1080}
+      }
+    });
+
+    video.srcObject = stream;
+    video.setAttribute('playsinline', 'true');
+    video.muted = true;
+    video.style.display = 'block';
+    overlay.style.display = 'none';
+    frame.style.display = 'block';
+
+    await enableContinuousFocus(stream.getVideoTracks()[0]);
+    await video.play();
+
+    scanning = true;
+    camBtn.textContent = 'カメラを止める';
+    requestAnimationFrame(scanLoop);
+  }catch(e){
+    console.error(e);
+    showToast('カメラを起動できませんでした。設定でカメラ許可を確認してね');
+  }
+}
+
+function stopCamera(){
+  scanning = false;
+  if(stream){
+    stream.getTracks().forEach(track => track.stop());
+    stream = null;
+  }
+  video.srcObject = null;
+  video.style.display = 'none';
+  overlay.style.display = 'flex';
+  frame.style.display = 'none';
+  camBtn.textContent = 'カメラで読み取る';
+}
+
+function decodeTalkCard(data){
+  if(!data) return null;
+
+  if(data.startsWith('TALKCARD_V3|')){
+    try{
+      return decodeURIComponent(data.slice('TALKCARD_V3|'.length));
+    }catch(e){ return null; }
   }
 
-  function stopCamera(){
-    scanning = false;
-    if(stream){ stream.getTracks().forEach(t => t.stop()); stream = null; }
-    video.style.display = 'none';
-    overlay.style.display = 'flex';
-    frame.style.display = 'none';
-    camBtn.textContent = 'カメラを起動する';
+  // 旧形式にも対応
+  if(data.startsWith('TALKCARD:')){
+    try{
+      return decodeURIComponent(data.slice('TALKCARD:'.length));
+    }catch(e){ return null; }
   }
 
-  camBtn.addEventListener('click', () => { scanning ? stopCamera() : startCamera(); });
+  return data;
+}
 
-  function scanLoop(){
-    if(!scanning) return;
+function addScannedQuestion(data){
+  const text = decodeTalkCard(data);
+  if(!text) return;
 
-    if(video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth && video.videoHeight){
-      // 画面中央の読み取り枠（約70%）だけを解析して検出率を上げる
+  const now = Date.now();
+  if(text === lastCode && now - lastCodeTime < 2500) return;
+
+  lastCode = text;
+  lastCodeTime = now;
+
+  if(!deck.includes(text)){
+    deck.push(text);
+    poolCountEl.textContent = deck.length;
+    showToast('質問を追加しました！');
+    if(navigator.vibrate) navigator.vibrate(60);
+  }
+}
+
+function tryJsQr(imageData, width, height){
+  try{
+    const code = jsQR(imageData.data, width, height, {
+      inversionAttempts: 'attemptBoth'
+    });
+    return code && code.data ? code.data : null;
+  }catch(e){
+    return null;
+  }
+}
+
+async function tryNativeQr(){
+  if(!('BarcodeDetector' in window)) return null;
+  try{
+    if(!window._qrDetector){
+      const formats = await BarcodeDetector.getSupportedFormats();
+      if(!formats.includes('qr_code')) return null;
+      window._qrDetector = new BarcodeDetector({formats:['qr_code']});
+    }
+    const codes = await window._qrDetector.detect(video);
+    return codes && codes[0] ? codes[0].rawValue : null;
+  }catch(e){
+    return null;
+  }
+}
+
+async function scanLoop(){
+  if(!scanning) return;
+
+  if(!scanBusy && video.readyState >= video.HAVE_CURRENT_DATA &&
+     video.videoWidth > 0 && video.videoHeight > 0){
+
+    scanBusy = true;
+
+    // 対応ブラウザでは標準QR検出を最優先
+    let data = await tryNativeQr();
+
+    if(!data){
       const vw = video.videoWidth;
       const vh = video.videoHeight;
-      const cropW = Math.floor(vw * 0.72);
-      const cropH = Math.floor(vh * 0.72);
-      const sx = Math.floor((vw - cropW) / 2);
-      const sy = Math.floor((vh - cropH) / 2);
+      const scale = Math.min(1, 1200 / Math.max(vw, vh));
+      const w = Math.round(vw * scale);
+      const h = Math.round(vh * scale);
 
-      // 大きすぎる映像は縮小してjsQRの処理負荷を抑える
-      const maxSize = 900;
-      const scale = Math.min(1, maxSize / Math.max(cropW, cropH));
-      canvas.width = Math.max(1, Math.floor(cropW * scale));
-      canvas.height = Math.max(1, Math.floor(cropH * scale));
+      // まず画面全体
+      canvas.width = w;
+      canvas.height = h;
+      ctx.drawImage(video, 0, 0, w, h);
+      data = tryJsQr(ctx.getImageData(0, 0, w, h), w, h);
 
-      ctx.drawImage(
-        video,
-        sx, sy, cropW, cropH,
-        0, 0, canvas.width, canvas.height
-      );
-
-      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const code = jsQR(
-        imgData.data,
-        imgData.width,
-        imgData.height,
-        { inversionAttempts: 'attemptBoth' }
-      );
-
-      if(code && code.data){
-        const now = Date.now();
-
-        if(code.data !== lastCode || now - lastCodeTime > 2500){
-          lastCode = code.data;
-          lastCodeTime = now;
-
-          // QRにはASCIIのURLエンコード文字列を入れているので、
-          // ここで安全に元の日本語へ戻す。
-          let text = code.data;
-          if(text.startsWith('TALKCARD:')){
-            try{
-              text = decodeURIComponent(text.slice('TALKCARD:'.length));
-            }catch(e){
-              showToast('QRの文字を読み取れませんでした');
-              requestAnimationFrame(scanLoop);
-              return;
-            }
-          }
-
-          // 同じ質問を連続して追加する事故も防ぐ
-          if(!deck.includes(text)){
-            deck.push(text);
-            poolCountEl.textContent = deck.length;
-            showToast('質問を追加しました！');
-            if(navigator.vibrate) navigator.vibrate(60);
-          }
-        }
+      // ダメなら中央75%を拡大
+      if(!data){
+        const cropW = Math.round(vw * 0.75);
+        const cropH = Math.round(vh * 0.75);
+        canvas.width = cropW;
+        canvas.height = cropH;
+        ctx.drawImage(
+          video,
+          Math.round(vw * 0.125),
+          Math.round(vh * 0.125),
+          cropW, cropH,
+          0, 0, cropW, cropH
+        );
+        data = tryJsQr(
+          ctx.getImageData(0, 0, cropW, cropH),
+          cropW, cropH
+        );
       }
     }
 
+    if(data) addScannedQuestion(data);
+    scanBusy = false;
+  }
+
+  requestAnimationFrame(scanLoop);
+}
+
+camBtn.addEventListener('click', () => {
+  if(scanning) stopCamera();
+  else startCamera();
+});
+
+          // QR生成時にUTF-8バイト列として埋め込んでいるので、元の文字列に戻す
+          try{ text = decodeURIComponent(escape(text)); }catch(e){ /* 変換できない場合はそのまま使う */ }
+          deck.push(text);
+          poolCountEl.textContent = deck.length;
+          showToast('質問を追加しました！');
+          if(navigator.vibrate) navigator.vibrate(60);
+        }
+      }
+    }
     requestAnimationFrame(scanLoop);
   }
 
